@@ -1,0 +1,107 @@
+[package]
+name = "tezweb"
+version = "0.1.0"
+edition = "2021"
+description = "World's fastest web framework for Rust"
+authors = ["TezWeb Team"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tezweb/tezweb"
+keywords = ["web", "framework", "http", "fast"]
+categories = ["web-programming", "network-programming"]
+
+[dependencies]
+dashmap = "6"
+tokio = { version = "1.35", features = ["full"] }
+h2 = "0.4"
+http = "1.0"
+bytes = "1.5"
+tokio-util = { version = "0.7", features = ["compat"] }
+socket2 = { version = "0.5", features = ["all"] }
+num_cpus = "1.16"
+httparse = "1.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+flate2 = "1.0"
+brotli = "6.0"
+sha1 = "0.10"
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+notify = "8.2.0"
+async-graphql = "7.2.1"
+
+# HTTP/3
+quinn = { version = "0.11" }
+h3 = { git = "https://github.com/hyperium/h3", rev = "704b37a" }
+h3-quinn = { git = "https://github.com/hyperium/h3", rev = "704b37a" }
+
+# TLS
+rustls = { version = "0.23" }
+rustls-pemfile = { version = "2" }
+tokio-rustls = { version = "0.26" }
+zstd = { version = "0.13", optional = true }
+worker = { version = "0.4", optional = true }
+hyper = { version = "0.14", features = ["server", "http2", "http1"] }
+
+# Linux only
+[target.'cfg(target_os = "linux")'.dependencies]
+monoio = { version = "0.2", features = ["sync", "iouring"] }
+libc = "0.2"
+
+# Windows only
+[target.'cfg(target_os = "windows")'.dependencies]
+winapi = { version = "0.3", features = [
+    "processthreadsapi",
+    "winbase",
+    "winerror"
+]}
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tokio-test = "0.4"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json"] }
+actix-web = "4"
+axum = "0.7"
+
+[features]
+default = ["compression"]
+compression = ["zstd"]
+tls = []
+http3 = []
+cloudflare = ["worker"]
+nightly = []
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench]
+lto = true
+codegen-units = 1
+
+
+
+
+[lib]
+name = "tezweb"
+path = "src/lib.rs"
+
+[workspace]
+members = ["actix-bench"]
+
+[[example]]
+name = "http3_client"
+required-features = ["http3"]
+
+[[example]]
+name = "http3_server"
+required-features = ["http3"]
+
+[[bench]]
+name = "against_actix"
+harness = false

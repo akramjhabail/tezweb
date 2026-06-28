@@ -1,0 +1,580 @@
+//! # TezWeb - Ultra Fast Web Framework
+
+#![allow(unsafe_code)]
+
+pub mod memory;
+pub mod io;
+pub mod common;
+pub mod http;
+pub mod router;
+pub mod middleware;
+pub mod ws;
+pub mod auth;
+pub mod upload;
+pub mod tls;
+pub mod sse;
+pub mod reload;
+pub mod proxy;
+
+// Re-exports
+pub use http::Method;
+pub use http::Request;
+pub use http::Response;
+pub use common::{
+    TezError, TezResult,
+    TezConfig,
+    StatusCode,
+    Headers,
+    init_health, increment_requests, health_json,
+    generate_request_id,
+    init_shutdown, trigger_shutdown, is_shutdown, listen_for_ctrlc,
+    mime_type, serve_file, resolve_path,
+};
+pub use router::Router;
+pub use middleware::{MiddlewareFn, MiddlewareChain, logger, cors};
+pub use ws::{WsSocket, WsFrame, make_ws_handler};
+pub use tls::TlsConfig;
+pub use sse::{SseEvent, SseStream, sse_channel};
+pub use reload::{start_default_watcher, start_watcher, is_reload_needed};
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::sync::Arc;
+use io::EventLoop;
+
+static WS_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+
+fn ws_runtime() -> &'static tokio::runtime::Runtime {
+    WS_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    })
+}
+
+pub struct TezWeb {
+    config:        TezConfig,
+    router:        Router,
+    middlewares:   Vec<MiddlewareFn>,
+    static_routes: Vec<(String, String)>,
+    tls_config:    Option<TlsConfig>,
+    proxy_rules:   Vec<proxy::ProxyRule>,
+}
+
+impl TezWeb {
+    pub fn new() -> Self {
+        Self {
+            config:        TezConfig::default(),
+            router:        Router::new(),
+            middlewares:   Vec::new(),
+            static_routes: Vec::new(),
+            tls_config:    None,
+            proxy_rules:   Vec::new(),
+        }
+    }
+
+    pub fn host(mut self, host: impl Into<String>) -> Self {
+        self.config = self.config.host(host);
+        self
+    }
+
+    pub fn port(mut self, port: u16) -> Self {
+        self.config = self.config.port(port);
+        self
+    }
+
+    pub fn workers(mut self, workers: usize) -> Self {
+        self.config = self.config.workers(workers);
+        self
+    }
+
+    pub fn middleware(mut self, mw: MiddlewareFn) -> Self {
+        self.middlewares.push(mw);
+        self
+    }
+
+    pub fn tls(mut self, tls_config: TlsConfig) -> Self {
+        self.tls_config = Some(tls_config);
+        self
+    }
+
+    pub fn proxy(mut self, prefix: &str, target: &str) -> Self {
+        self.proxy_rules.push(proxy::ProxyRule {
+            prefix: prefix.to_string(),
+            target: target.to_string(),
+        });
+        self
+    }
+
+    pub fn static_files(mut self, route: impl Into<String>, dir: impl Into<String>) -> Self {
+        self.static_routes.push((route.into(), dir.into()));
+        self
+    }
+
+    pub fn get<F, Fut>(mut self, path: &str, handler: F) -> Self
+    where
+        F: Fn(Request, HashMap<String, String>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Response> + Send + 'static,
+    {
+        self.router.get(path, handler);
+        self
+    }
+
+    pub fn post<F, Fut>(mut self, path: &str, handler: F) -> Self
+    where
+        F: Fn(Request, HashMap<String, String>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Response> + Send + 'static,
+    {
+        self.router.post(path, handler);
+        self
+    }
+
+    pub fn put<F, Fut>(mut self, path: &str, handler: F) -> Self
+    where
+        F: Fn(Request, HashMap<String, String>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Response> + Send + 'static,
+    {
+        self.router.put(path, handler);
+        self
+    }
+
+    pub fn delete<F, Fut>(mut self, path: &str, handler: F) -> Self
+    where
+        F: Fn(Request, HashMap<String, String>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Response> + Send + 'static,
+    {
+        self.router.delete(path, handler);
+        self
+    }
+
+    pub fn ws<F, Fut>(mut self, path: &str, handler: F) -> Self
+    where
+        F: Fn(ws::WsSocket) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.router.add_ws(path, make_ws_handler(handler));
+        self
+    }
+
+    pub async fn run(mut self) -> TezResult<()> {
+        let addr   = self.config.addr();
+        let is_tls = self.tls_config.is_some();
+
+        // ✅ Auto health check
+        self.router.get("/health", |_req, _params| async move {
+            Response::ok().body(health_json().into_bytes())
+        });
+
+        // ✅ Proxy routes — exact + wildcard dono
+        let proxy_rules = self.proxy_rules.clone();
+        for rule in proxy_rules.iter() {
+            let rule_prefix = rule.prefix.clone();
+            let rule_target = rule.target.clone();
+
+            // Exact: /api
+            {
+                let target = rule_target.clone();
+                let prefix = rule_prefix.clone();
+            println!("📡 Registering proxy route: {}", prefix);
+                self.router.get(&prefix, move |req, _params| {
+                    let target = target.clone();
+                    async move {
+                    let target = target.clone();
+                    async move {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        let t = target.clone();
+                        std::thread::spawn(move || {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all().build().unwrap();
+                            let resp = rt.block_on(proxy::handle_proxy(req, &t))
+                                .unwrap_or_else(|_| Response::new(502).text("Proxy failed"));
+                            let _ = tx.send(resp);
+                        });
+                        rx.await.unwrap_or_else(|_| Response::new(502).text("Proxy failed"))
+                    }
+                });
+            }
+
+            // Wildcard: /api/:path
+                    let target = target.clone();
+                    async move {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        let t = target.clone();
+                        std::thread::spawn(move || {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all().build().unwrap();
+                            let resp = rt.block_on(proxy::handle_proxy(req, &t))
+                                .unwrap_or_else(|_| Response::new(502).text("Proxy failed"));
+                            let _ = tx.send(resp);
+                        });
+                        rx.await.unwrap_or_else(|_| Response::new(502).text("Proxy failed"))
+                    }
+                });
+                        match result {
+                            Ok(Ok(resp)) => resp,
+                            _ => Response::new(502).text("Proxy failed"),
+                        }
+                    }
+                });
+            }
+        }
+
+        // ✅ Static file routes
+        let static_routes   = Arc::new(self.static_routes);
+        let static_routes_c = Arc::clone(&static_routes);
+        for (route, dir) in static_routes_c.iter() {
+            let route_prefix = route.clone();
+            let static_dir   = dir.clone();
+            self.router.get(&format!("{}/:file", route), move |req, _params| {
+                let path   = req.path.clone();
+                let prefix = route_prefix.clone();
+                let sdir   = static_dir.clone();
+                async move {
+                    let file_path = resolve_path(&path, &prefix, &sdir);
+                    serve_file(&file_path).await
+                }
+            });
+        }
+
+        let router      = Arc::new(self.router);
+        let config      = Arc::new(self.config);
+        let middlewares = Arc::new(self.middlewares);
+
+        let _ = ws_runtime();
+        init_health();
+        listen_for_ctrlc();
+
+        // ✅ Hot reload
+        if std::env::var("TEZWEB_RELOAD").is_ok() {
+            reload::start_default_watcher();
+        }
+
+        #[cfg(feature = "tls")]
+        let tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>> =
+            if let Some(ref tls_cfg) = self.tls_config {
+                match tls::TlsAcceptor::new(tls_cfg) {
+                    Ok(acceptor) => {
+                        let arc_cfg = acceptor.arc_config();
+                        Some(Arc::new(tokio_rustls::TlsAcceptor::from(arc_cfg)))
+                    }
+                    Err(e) => {
+                        eprintln!("❌ TLS Error: {}", e);
+                        return Err(TezError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            e.to_string(),
+                        )));
+                    }
+                }
+            } else {
+                None
+            };
+
+        #[cfg(not(feature = "tls"))]
+        let _tls_acceptor: Option<()> = None;
+
+        let protocol = if is_tls { "https" } else { "http" };
+        println!("🚀 TezWeb on {}://{} — {} workers", protocol, addr, config.workers);
+        println!("❤️  Health check: {}://{}/health", protocol, addr);
+        println!("🛑 Press Ctrl+C to stop gracefully");
+
+        let event_loop = EventLoop::new(config.workers);
+
+        event_loop.run(move || {
+            let router      = Arc::clone(&router);
+            let _config     = Arc::clone(&config);
+            let middlewares = Arc::clone(&middlewares);
+            let addr        = addr.clone();
+
+            #[cfg(feature = "tls")]
+            let tls_acceptor = tls_acceptor.clone();
+
+            async move {
+                #[cfg(target_os = "linux")]
+                let listener = {
+                    match monoio::net::TcpListener::bind(
+                        addr.parse::<std::net::SocketAddr>().unwrap()
+                    ) {
+                        Ok(l)  => l,
+                        Err(e) => { eprintln!("Bind error: {}", e); return; }
+                    }
+                };
+
+                #[cfg(not(target_os = "linux"))]
+                let listener = {
+                    match io::create_listener(&addr) {
+                        Ok(std_listener) => {
+                            match tokio::net::TcpListener::from_std(std_listener) {
+                                Ok(l)  => l,
+                                Err(e) => { eprintln!("Bind error: {}", e); return; }
+                            }
+                        }
+                        Err(e) => { eprintln!("Bind error: {}", e); return; }
+                    }
+                };
+
+                loop {
+                    if is_shutdown() { break; }
+
+                    let (stream, peer) = match io::accept(&listener).await {
+                        Ok(v)  => v,
+                        Err(e) => { eprintln!("Accept: {}", e); continue; }
+                    };
+
+                    let router      = Arc::clone(&router);
+                    let middlewares = Arc::clone(&middlewares);
+
+                    #[cfg(feature = "tls")]
+                    {
+                        if let Some(ref acceptor) = tls_acceptor {
+                            let acceptor = Arc::clone(acceptor);
+
+                            #[cfg(target_os = "linux")]
+                            let tokio_stream = {
+                                use std::os::unix::io::IntoRawFd;
+                                use std::os::unix::io::FromRawFd;
+                                let raw_fd     = stream.into_raw_fd();
+                                let std_stream = unsafe { std::net::TcpStream::from_raw_fd(raw_fd) };
+                                std_stream.set_nonblocking(true).ok();
+                                match tokio::net::TcpStream::from_std(std_stream) {
+                                    Ok(s)  => s,
+                                    Err(e) => { eprintln!("Stream error: {}", e); continue; }
+                                }
+                            };
+
+                            #[cfg(not(target_os = "linux"))]
+                            let tokio_stream = stream;
+
+                            tokio::spawn(async move {
+                                match acceptor.accept(tokio_stream).await {
+                                    Ok(tls_stream) => {
+                                        if let Err(e) = handle_tls_connection(
+                                            tls_stream, peer, router, middlewares
+                                        ).await {
+                                            eprintln!("TLS Conn [{}]: {}", peer, e);
+                                        }
+                                    }
+                                    Err(e) => eprintln!("TLS Accept [{}]: {}", peer, e),
+                                }
+                            });
+                            continue;
+                        }
+                    }
+
+                    #[cfg(target_os = "linux")]
+                    monoio::spawn(async move {
+                        if let Err(e) = handle_connection(stream, peer, router, middlewares).await {
+                            eprintln!("Conn [{}]: {}", peer, e);
+                        }
+                    });
+
+                    #[cfg(not(target_os = "linux"))]
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_connection(stream, peer, router, middlewares).await {
+                            eprintln!("Conn [{}]: {}", peer, e);
+                        }
+                    });
+                }
+            }
+        });
+
+        Ok(())
+    }
+}
+
+impl Default for TezWeb {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+async fn handle_connection(
+    mut stream:  io::TcpStream,
+    _peer:       std::net::SocketAddr,
+    router:      Arc<Router>,
+    middlewares: Arc<Vec<MiddlewareFn>>,
+) -> TezResult<()> {
+    use io::TcpStreamExt;
+
+    let mut buf = io::IoBuffer::with_capacity(io::READ_BUFFER_SIZE);
+
+    loop {
+        let n = stream.read_buf(&mut buf).await?;
+        if n == 0 { break; }
+
+        let request = match Request::parse(&mut buf) {
+            Ok(Some(req)) => req,
+            Ok(None)      => continue,
+            Err(code)     => {
+                let mut out = io::IoBuffer::with_capacity(256);
+                Response::new(code).write_to(&mut out);
+                stream.write_all_buf(&mut out).await?;
+                break;
+            }
+        };
+
+        // ✅ WebSocket check
+        if let Some(handshake) = ws::WsHandshake::from_headers(&request.headers) {
+            let path = request.path.clone();
+            if let Some(ws_handler) = router.find_ws(&path) {
+                let response = handshake.response();
+                let mut out  = io::IoBuffer::with_capacity(256);
+                out.inner.extend_from_slice(response.as_bytes());
+                stream.write_all_buf(&mut out).await?;
+
+                let std_stream = stream.into_std_tcp_stream();
+                std_stream.set_nonblocking(true).ok();
+
+                ws_runtime().spawn(async move {
+                    match tokio::net::TcpStream::from_std(std_stream) {
+                        Ok(tokio_stream) => {
+                            let socket = ws::WsSocket::new(tokio_stream);
+                            ws_handler(socket).await;
+                        }
+                        Err(e) => eprintln!("WS stream error: {}", e),
+                    }
+                });
+                return Ok(());
+            }
+        }
+
+        increment_requests();
+        let request_id = generate_request_id();
+        let keep_alive = request.keep_alive;
+        let method     = request.method;
+        let path       = request.path.clone();
+        let router_c   = Arc::clone(&router);
+        let path_c     = path.clone();
+
+        let next: middleware::Next = Arc::new(move |req: Request| {
+            let router = Arc::clone(&router_c);
+            let path   = path_c.clone();
+            Box::pin(async move {
+                if let Some((handler, params)) = router.find(method, &path) {
+                    handler(req, params).await
+                } else {
+                    Response::not_found().text(format!("404: {}", path))
+                }
+            })
+        });
+
+        let chain = MiddlewareChain {
+            middlewares: middlewares.as_ref().clone(),
+        };
+        let response = chain.run(request, next).await;
+
+        // ✅ SSE check
+        if response.sse.is_some() {
+            let mut resp = response;
+            resp.headers.push(("X-Request-ID".to_string(), request_id));
+
+            let mut out = io::IoBuffer::with_capacity(512);
+            resp.write_sse_headers(&mut out);
+            stream.write_all_buf(&mut out).await?;
+
+            let std_stream = stream.into_std_tcp_stream();
+            std_stream.set_nonblocking(true).ok();
+
+            ws_runtime().spawn(async move {
+                match tokio::net::TcpStream::from_std(std_stream) {
+                    Ok(mut tokio_stream) => {
+                        use tokio::io::AsyncWriteExt;
+                        if let Some(mut receiver) = resp.sse {
+                            while let Some(event) = receiver.rx.recv().await {
+                                let bytes = event.format().into_bytes();
+                                if tokio_stream.write_all(&bytes).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("SSE stream error: {}", e),
+                }
+            });
+            return Ok(());
+        }
+
+        let mut out  = io::IoBuffer::with_capacity(io::WRITE_BUFFER_SIZE);
+        let mut resp = response;
+        resp.keep_alive = keep_alive;
+        resp.headers.push(("X-Request-ID".to_string(), request_id));
+        resp.write_to(&mut out);
+        stream.write_all_buf(&mut out).await?;
+
+        thread_bump_reset!();
+
+        if !keep_alive { break; }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "tls")]
+async fn handle_tls_connection(
+    mut stream:  tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    _peer:       std::net::SocketAddr,
+    router:      Arc<Router>,
+    middlewares: Arc<Vec<MiddlewareFn>>,
+) -> TezResult<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buf = vec![0u8; io::READ_BUFFER_SIZE];
+
+    loop {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 { break; }
+
+        let mut io_buf = io::IoBuffer::with_capacity(n);
+        io_buf.inner.extend_from_slice(&buf[..n]);
+
+        let request = match Request::parse(&mut io_buf) {
+            Ok(Some(req)) => req,
+            Ok(None)      => continue,
+            Err(code)     => {
+                let mut out = io::IoBuffer::with_capacity(256);
+                Response::new(code).write_to(&mut out);
+                stream.write_all(&out.inner).await?;
+                break;
+            }
+        };
+
+        increment_requests();
+        let request_id = generate_request_id();
+        let keep_alive = request.keep_alive;
+        let method     = request.method;
+        let path       = request.path.clone();
+        let router_c   = Arc::clone(&router);
+        let path_c     = path.clone();
+
+        let next: middleware::Next = Arc::new(move |req: Request| {
+            let router = Arc::clone(&router_c);
+            let path   = path_c.clone();
+            Box::pin(async move {
+                if let Some((handler, params)) = router.find(method, &path) {
+                    handler(req, params).await
+                } else {
+                    Response::not_found().text(format!("404: {}", path))
+                }
+            })
+        });
+
+        let chain = MiddlewareChain {
+            middlewares: middlewares.as_ref().clone(),
+        };
+        let response = chain.run(request, next).await;
+
+        let mut out  = io::IoBuffer::with_capacity(io::WRITE_BUFFER_SIZE);
+        let mut resp = response;
+        resp.keep_alive = keep_alive;
+        resp.headers.push(("X-Request-ID".to_string(), request_id));
+        resp.write_to(&mut out);
+        stream.write_all(&out.inner).await?;
+
+        thread_bump_reset!();
+
+        if !keep_alive { break; }
+    }
+
+    Ok(())
+}

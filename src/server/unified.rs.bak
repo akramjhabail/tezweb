@@ -1,0 +1,282 @@
+// src/server/unified.rs — Per-core workers + SO_REUSEPORT
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::io;
+
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::ServerConfig;
+use crate::io::create_listener;
+
+pub const ALT_SVC: &str = r#"h3=":443"; ma=86400"#;
+
+pub struct UnifiedServer {
+    port: u16,
+    tls_config: Arc<ServerConfig>,
+}
+
+impl UnifiedServer {
+    pub fn new(port: u16, tls_config: Arc<ServerConfig>) -> Self {
+        Self { port, tls_config }
+    }
+
+    pub async fn run(self) -> io::Result<()> {
+        let cpus = num_cpus::get();
+        println!("🚀 TezWeb Unified Server on port {}", self.port);
+        println!("   📡 TCP :{} → HTTP/1.1 + HTTP/2", self.port);
+        println!("   ⚡ UDP :{} → HTTP/3 QUIC", self.port);
+        println!("   🔒 TLS + ALPN + Alt-Svc enabled");
+        println!("   🧠 {} CPU cores — SO_REUSEPORT per core\n", cpus);
+
+        let port = self.port;
+        let tls_config = self.tls_config.clone();
+
+        // ✅ QUIC alag thread mein (UDP hai, share nahi hota)
+        let quic_tls = tls_config.clone();
+        let quic_handle = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+                    if let Err(e) = run_quic_server(addr, quic_tls).await {
+                        eprintln!("QUIC error: {e}");
+                    }
+                })
+        });
+
+        // ✅ TCP — har CPU core ka apna listener (SO_REUSEPORT)
+        let mut tcp_handles = vec![];
+        for core_id in 0..cpus {
+            let tls = tls_config.clone();
+            let addr_str = format!("0.0.0.0:{}", port);
+
+            tcp_handles.push(std::thread::spawn(move || {
+                // ✅ Mac optimized runtime
+                #[cfg(target_os = "macos")]
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .event_interval(31)
+                    .global_queue_interval(31)
+                    .max_blocking_threads(512)
+                    .enable_all()
+                    .build()
+                    .unwrap();
+
+                // ✅ Windows optimized runtime
+                #[cfg(target_os = "windows")]
+                let rt = {
+                    unsafe {
+                        winapi::um::processthreadsapi::SetThreadPriority(
+                            winapi::um::processthreadsapi::GetCurrentThread(),
+                            2,
+                        );
+                    }
+                    tokio::runtime::Builder::new_current_thread()
+                        .event_interval(31)
+                        .global_queue_interval(31)
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                };
+
+                // ✅ Linux — monoio io_uring
+                #[cfg(target_os = "linux")]
+                {
+                    monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+                        .with_entries(4096)
+                        .enable_timer()
+                        .build()
+                        .unwrap()
+                        .block_on(async move {
+                            println!("   ✅ Core {} TCP listening on {}", core_id, addr_str);
+                            let std_listener = create_listener(&addr_str).unwrap();
+                            let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+                            let acceptor = TlsAcceptor::from(tls);
+                            run_tcp_loop(listener, acceptor).await;
+                        });
+                }
+
+                // ✅ Mac + Windows
+                #[cfg(not(target_os = "linux"))]
+                rt.block_on(async move {
+                    println!("   ✅ Core {} TCP listening on {}", core_id, addr_str);
+                    let std_listener = create_listener(&addr_str).unwrap();
+                    let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+                    let acceptor = TlsAcceptor::from(tls);
+                    run_tcp_loop(listener, acceptor).await;
+                });
+            }));
+        }
+
+        for h in tcp_handles { let _ = h.join(); }
+        let _ = quic_handle.join();
+        Ok(())
+    }
+}
+
+async fn run_tcp_loop(
+    listener: tokio::net::TcpListener,
+    acceptor: TlsAcceptor,
+) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, peer)) => {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    match acceptor.accept(stream).await {
+                        Ok(tls_stream) => {
+                            let protocol = tls_stream
+                                .get_ref().1
+                                .alpn_protocol()
+                                .map(|p| String::from_utf8_lossy(p).to_string())
+                                .unwrap_or_else(|| "http/1.1".to_string());
+                            match protocol.as_str() {
+                                "h2" => handle_h2(tls_stream).await,
+                                _    => handle_h1(tls_stream).await,
+                            }
+                        }
+                        Err(e) => eprintln!("TLS [{peer}] error: {e}"),
+                    }
+                });
+            }
+            Err(e) => eprintln!("Accept error: {e}"),
+        }
+    }
+}
+
+pub fn make_tls_config(cert_path: &str, key_path: &str) -> Arc<ServerConfig> {
+    use tokio_rustls::rustls::pki_types::CertificateDer;
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let certs: Vec<CertificateDer> =
+        rustls_pemfile::certs(&mut BufReader::new(File::open(cert_path).expect("cert nahi mila")))
+            .map(|c| c.unwrap())
+            .collect();
+
+    let key = rustls_pemfile::private_key(
+        &mut BufReader::new(File::open(key_path).expect("key nahi mili"))
+    ).unwrap().expect("private key nahi mili");
+
+    let mut cfg = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .expect("TLS config error");
+
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Arc::new(cfg)
+}
+
+async fn handle_h1<S>(mut stream: tokio_rustls::server::TlsStream<S>)
+where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = vec![0u8; 8192];
+    if let Ok(_n) = stream.read(&mut buf).await {
+        let body = "TezWeb HTTP/1.1! 🚀".as_bytes();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nAlt-Svc: {ALT_SVC}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.write_all(body).await;
+    }
+}
+
+async fn handle_h2<S>(stream: tokio_rustls::server::TlsStream<S>)
+where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let svc = hyper::service::service_fn(|_req| async move {
+        Ok::<_, hyper::Error>(
+            hyper::Response::builder()
+                .header("Alt-Svc", ALT_SVC)
+                .header("content-type", "text/plain")
+                .body(hyper::Body::from("TezWeb HTTP/2! 🚀"))
+                .unwrap()
+        )
+    });
+    let _ = hyper::server::conn::Http::new()
+        .http2_only(true)
+        .serve_connection(stream, svc)
+        .await;
+}
+
+async fn run_quic_server(
+    addr: SocketAddr,
+    _tls_config: Arc<ServerConfig>,
+) -> io::Result<()> {
+    use tokio_rustls::rustls::pki_types::CertificateDer;
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let certs: Vec<CertificateDer> =
+        rustls_pemfile::certs(&mut BufReader::new(
+            File::open("certs/cert.pem").map_err(io::Error::other)?
+        )).map(|c| c.unwrap()).collect();
+
+    let key = rustls_pemfile::private_key(
+        &mut BufReader::new(
+            File::open("certs/key.pem").map_err(io::Error::other)?
+        )
+    ).unwrap().expect("key nahi mili");
+
+    let mut quic_rustls = quinn::rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(io::Error::other)?;
+
+    quic_rustls.alpn_protocols = vec![b"h3".to_vec()];
+
+    let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(quic_rustls)
+        .map_err(io::Error::other)?;
+
+    let endpoint = quinn::Endpoint::server(
+        quinn::ServerConfig::with_crypto(Arc::new(quic_crypto)),
+        addr,
+    ).map_err(io::Error::other)?;
+
+    println!("✅ QUIC listening on {}", addr);
+
+    while let Some(incoming) = endpoint.accept().await {
+        tokio::spawn(async move {
+            match incoming.await {
+                Ok(conn) => handle_h3(conn).await,
+                Err(e)   => eprintln!("QUIC conn error: {e}"),
+            }
+        });
+    }
+    Ok(())
+}
+
+async fn handle_h3(conn: quinn::Connection) {
+    let mut h3_conn = match h3::server::Connection::new(
+        h3_quinn::Connection::new(conn)
+    ).await {
+        Ok(c)  => c,
+        Err(e) => { eprintln!("H3 conn error: {e}"); return; }
+    };
+    loop {
+        match h3_conn.accept().await {
+            Ok(Some(resolver)) => {
+                let (req, mut stream) = match resolver.resolve_request().await {
+                    Ok(v)  => v,
+                    Err(e) => { eprintln!("H3 resolve: {e}"); continue; }
+                };
+                println!("   [H3] {} {}", req.method(), req.uri());
+                tokio::spawn(async move {
+                    let resp = http::Response::builder()
+                        .status(200)
+                        .header("content-type", "text/plain")
+                        .header("Alt-Svc", ALT_SVC)
+                        .body(()).unwrap();
+                    let _ = stream.send_response(resp).await;
+                    let _ = stream.send_data(bytes::Bytes::from("TezWeb HTTP/3! ⚡")).await;
+                    let _ = stream.finish().await;
+                });
+            }
+            Ok(None) => break,
+            Err(e)   => { eprintln!("H3 accept: {e}"); break; }
+        }
+    }
+}
