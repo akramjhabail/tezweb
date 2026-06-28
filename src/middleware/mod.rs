@@ -7,7 +7,7 @@ use crate::http::Request;
 use crate::http::Response;
 
 pub mod rate_limit;
-pub use rate_limit::{RateLimiter, rate_limit};
+pub use rate_limit::{RateLimiter, rate_limit, rate_limit_middleware};
 
 pub mod compression;
 pub use compression::{compress, detect_encoding, Encoding};

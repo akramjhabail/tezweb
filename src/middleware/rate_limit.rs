@@ -52,3 +52,30 @@ impl RateLimiter {
 pub fn rate_limit(max_requests: u64, window_secs: u64) -> RateLimiter {
     RateLimiter::new(max_requests, window_secs)
 }
+
+/// Rate limit middleware wrapper (use with .middleware())
+/// Example: .middleware(rate_limit_middleware(100, 60))
+pub fn rate_limit_middleware(max_requests: u64, window_secs: u64) -> crate::middleware::MiddlewareFn {
+    use std::sync::Arc;
+    let limiter = Arc::new(RateLimiter::new(max_requests, window_secs));
+    Arc::new(move |req, next| {
+        let limiter = Arc::clone(&limiter);
+        Box::pin(async move {
+            let key = req.headers.iter()
+                .find(|(k, _)| k.to_lowercase() == "x-forwarded-for")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| "global".to_string());
+
+            match limiter.check(&key) {
+                Ok(remaining) => {
+                    let mut response = next(req).await;
+                    response.headers.push(("X-RateLimit-Remaining".to_string(), remaining.to_string()));
+                    response
+                }
+                Err(_) => {
+                    crate::http::Response::new(429).body(b"Rate limit exceeded".to_vec())
+                }
+            }
+        })
+    })
+}

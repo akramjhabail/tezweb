@@ -1,4 +1,5 @@
 use tezweb::{TezWeb, Response, logger, cors};
+use tezweb::middleware::rate_limit_middleware;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -16,6 +17,7 @@ async fn main() {
         .workers(4)
         .middleware(logger())
         .middleware(cors("*"))
+        .middleware(rate_limit_middleware(5, 10))
         .get("/users/:id", |req, params| async move {
             let id: u32 = params["id"].parse().unwrap_or(0);
 
