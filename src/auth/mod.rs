@@ -74,24 +74,17 @@ pub fn jwt_decode(token: &str, secret: &str) -> Option<Claims> {
 pub fn extract_bearer(header: &str) -> Option<&str> {
     header.strip_prefix("Bearer ")
 }
-
-// HMAC-SHA256 implementation (no external crate needed)
+// Real HMAC-SHA256 implementation using hmac + sha2 crates
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    // Simple HMAC simulation using sha1 crate
-    let mut hasher = DefaultHasher::new();
-    key.hash(&mut hasher);
-    data.hash(&mut hasher);
-    let h = hasher.finish();
-
-    let mut result = [0u8; 32];
-    let bytes = h.to_le_bytes();
-    for i in 0..32 {
-        result[i] = bytes[i % 8] ^ (i as u8);
-    }
-    result
+    use hmac::{Hmac, Mac, KeyInit};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
+    mac.update(data);
+    let result = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
 }
 
 fn extract_json_str(json: &str, key: &str) -> Option<String> {
