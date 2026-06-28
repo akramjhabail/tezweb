@@ -68,7 +68,9 @@ Most Rust web frameworks are powerful but complex. TezWeb is different:
 | Reverse Proxy | ✅ Verified | Prefix stripping |
 | Static Files | ✅ Verified | Directory serving |
 | TLS/HTTPS | ✅ Verified | Rustls backend |
-| HTTP/3 / QUIC | 🧪 Experimental | Quinn backend |
+| HTTP/3 / QUIC | ✅ Verified | Quinn backend, tested end-to-end |
+| Rate Limiting | ✅ Verified | Per-IP sliding window |
+| JWT Auth | ✅ Verified | HMAC-SHA256 signed tokens |
 
 ---
 
@@ -145,9 +147,8 @@ TezWeb
 ## Roadmap
 
 - [ ] io_uring support on Linux (2x more performance)
-- [ ] HTTP/3 stable
+- [x] HTTP/3 stable
 - [ ] Connection pooling for proxy
-- [ ] JWT auth built-in
 - [ ] Hot reload in dev mode
 
 ---
