@@ -3,6 +3,7 @@ use http::StatusCode;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    quinn::rustls::crypto::ring::default_provider().install_default().ok();
     // Wahi cert.pem/key.pem use karo jo TLS step mein bane
     let tls = make_tls_config("cert.pem", "key.pem")?;
 

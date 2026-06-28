@@ -8,6 +8,7 @@ use quinn::ClientConfig;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    quinn::rustls::crypto::ring::default_provider().install_default().ok();
     let mut crypto = h3_quinn::quinn::rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipVerify))
